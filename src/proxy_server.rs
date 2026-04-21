@@ -3,11 +3,59 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
-use tokio_rustls::TlsAcceptor;
+use tokio_rustls::rustls::client::danger::{
+    HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
+};
+use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use tokio_rustls::rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use crate::config::Config;
 use crate::domain_fronter::DomainFronter;
 use crate::mitm::MitmCertManager;
+
+const SNI_REWRITE_SUFFIXES: &[&str] = &[
+    "youtube.com",
+    "youtu.be",
+    "youtube-nocookie.com",
+    "youtubeeducation.com",
+    "googlevideo.com",
+    "ytimg.com",
+    "ggpht.com",
+    "gvt1.com",
+    "gvt2.com",
+    "doubleclick.net",
+    "googlesyndication.com",
+    "googleadservices.com",
+    "google-analytics.com",
+    "googletagmanager.com",
+    "googletagservices.com",
+    "fonts.googleapis.com",
+];
+
+fn matches_sni_rewrite(host: &str) -> bool {
+    let h = host.to_ascii_lowercase();
+    let h = h.trim_end_matches('.');
+    SNI_REWRITE_SUFFIXES
+        .iter()
+        .any(|s| h == *s || h.ends_with(&format!(".{}", s)))
+}
+
+fn hosts_override<'a>(hosts: &'a std::collections::HashMap<String, String>, host: &str) -> Option<&'a str> {
+    let h = host.to_ascii_lowercase();
+    let h = h.trim_end_matches('.');
+    if let Some(ip) = hosts.get(h) {
+        return Some(ip.as_str());
+    }
+    let parts: Vec<&str> = h.split('.').collect();
+    for i in 1..parts.len() {
+        let parent = parts[i..].join(".");
+        if let Some(ip) = hosts.get(&parent) {
+            return Some(ip.as_str());
+        }
+    }
+    None
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProxyError {
@@ -20,17 +68,48 @@ pub struct ProxyServer {
     port: u16,
     fronter: Arc<DomainFronter>,
     mitm: Arc<Mutex<MitmCertManager>>,
+    rewrite_ctx: Arc<RewriteCtx>,
+}
+
+pub struct RewriteCtx {
+    pub google_ip: String,
+    pub front_domain: String,
+    pub hosts: std::collections::HashMap<String, String>,
+    pub tls_connector: TlsConnector,
 }
 
 impl ProxyServer {
     pub fn new(config: &Config, mitm: Arc<Mutex<MitmCertManager>>) -> Result<Self, ProxyError> {
         let fronter = DomainFronter::new(config)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
+
+        let tls_config = if config.verify_ssl {
+            let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth()
+        } else {
+            ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerify))
+                .with_no_client_auth()
+        };
+        let tls_connector = TlsConnector::from(Arc::new(tls_config));
+
+        let rewrite_ctx = Arc::new(RewriteCtx {
+            google_ip: config.google_ip.clone(),
+            front_domain: config.front_domain.clone(),
+            hosts: config.hosts.clone(),
+            tls_connector,
+        });
+
         Ok(Self {
             host: config.listen_host.clone(),
             port: config.listen_port,
             fronter: Arc::new(fronter),
             mitm,
+            rewrite_ctx,
         })
     }
 
@@ -53,8 +132,9 @@ impl ProxyServer {
             let _ = sock.set_nodelay(true);
             let fronter = self.fronter.clone();
             let mitm = self.mitm.clone();
+            let rewrite_ctx = self.rewrite_ctx.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_client(sock, fronter, mitm).await {
+                if let Err(e) = handle_client(sock, fronter, mitm, rewrite_ctx).await {
                     tracing::debug!("client {} closed: {}", peer, e);
                 }
             });
@@ -66,6 +146,7 @@ async fn handle_client(
     mut sock: TcpStream,
     fronter: Arc<DomainFronter>,
     mitm: Arc<Mutex<MitmCertManager>>,
+    rewrite_ctx: Arc<RewriteCtx>,
 ) -> std::io::Result<()> {
     // Read the first request (head only).
     let (head, leftover) = match read_http_head(&mut sock).await? {
@@ -77,7 +158,12 @@ async fn handle_client(
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad request"))?;
 
     if method.eq_ignore_ascii_case("CONNECT") {
-        do_connect(sock, &target, fronter, mitm).await
+        let (host, port) = parse_host_port(&target);
+        if matches_sni_rewrite(&host) || hosts_override(&rewrite_ctx.hosts, &host).is_some() {
+            do_sni_rewrite_connect(sock, &host, port, mitm, rewrite_ctx).await
+        } else {
+            do_connect(sock, &target, fronter, mitm).await
+        }
     } else {
         do_plain_http(sock, &head, &leftover, fronter).await
     }
@@ -187,6 +273,142 @@ async fn do_connect(
         }
     }
     Ok(())
+}
+
+async fn do_sni_rewrite_connect(
+    mut sock: TcpStream,
+    host: &str,
+    port: u16,
+    mitm: Arc<Mutex<MitmCertManager>>,
+    rewrite_ctx: Arc<RewriteCtx>,
+) -> std::io::Result<()> {
+    sock.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
+    sock.flush().await?;
+
+    let target_ip = hosts_override(&rewrite_ctx.hosts, host)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| rewrite_ctx.google_ip.clone());
+
+    tracing::info!(
+        "SNI-rewrite tunnel -> {}:{} via {} (outbound SNI={})",
+        host, port, target_ip, rewrite_ctx.front_domain
+    );
+
+    // Accept browser TLS with a cert we sign for `host`.
+    let server_config = {
+        let mut m = mitm.lock().await;
+        match m.get_server_config(host) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("cert gen failed for {}: {}", host, e);
+                return Ok(());
+            }
+        }
+    };
+    let inbound = match TlsAcceptor::from(server_config).accept(sock).await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::debug!("inbound TLS accept failed for {}: {}", host, e);
+            return Ok(());
+        }
+    };
+
+    // Open outbound TLS to google_ip with SNI=front_domain.
+    let upstream_tcp = match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        TcpStream::connect((target_ip.as_str(), port)),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            tracing::debug!("upstream connect failed for {}: {}", host, e);
+            return Ok(());
+        }
+        Err(_) => {
+            tracing::debug!("upstream connect timeout for {}", host);
+            return Ok(());
+        }
+    };
+    let _ = upstream_tcp.set_nodelay(true);
+
+    let server_name = match ServerName::try_from(rewrite_ctx.front_domain.clone()) {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::error!("invalid front_domain '{}': {}", rewrite_ctx.front_domain, e);
+            return Ok(());
+        }
+    };
+    let outbound = match rewrite_ctx
+        .tls_connector
+        .connect(server_name, upstream_tcp)
+        .await
+    {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::debug!("outbound TLS connect failed for {}: {}", host, e);
+            return Ok(());
+        }
+    };
+
+    // Bridge decrypted bytes between the two TLS streams.
+    let (mut ir, mut iw) = tokio::io::split(inbound);
+    let (mut or, mut ow) = tokio::io::split(outbound);
+    let client_to_server = async { tokio::io::copy(&mut ir, &mut ow).await };
+    let server_to_client = async { tokio::io::copy(&mut or, &mut iw).await };
+    tokio::select! {
+        _ = client_to_server => {}
+        _ = server_to_client => {}
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct NoVerify;
+
+impl ServerCertVerifier for NoVerify {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, tokio_rustls::rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, tokio_rustls::rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, tokio_rustls::rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![
+            SignatureScheme::RSA_PKCS1_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA384,
+            SignatureScheme::RSA_PKCS1_SHA512,
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::RSA_PSS_SHA384,
+            SignatureScheme::RSA_PSS_SHA512,
+            SignatureScheme::ED25519,
+        ]
+    }
 }
 
 fn parse_host_port(target: &str) -> (String, u16) {

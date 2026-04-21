@@ -29,6 +29,7 @@ httparse = "1"
 rand = "0.8"
 h2 = "0.4"
 http = "1"
+flate2 = "1"
 
 [profile.release]
 panic = "abort"

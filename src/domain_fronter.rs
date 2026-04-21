@@ -674,15 +674,10 @@ where
 }
 
 fn decode_gzip(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
-    // Minimal gzip decode — we don't pull in flate2 to keep deps small.
-    // Apps Script typically doesn't emit gzip to us (we disable brotli, but
-    // Google's frontend may still use gzip). On decode failure we just pass
-    // the raw bytes through; the caller ignores errors.
-    let _ = data;
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Other,
-        "gzip decode not implemented",
-    ))
+    use std::io::Read;
+    let mut out = Vec::with_capacity(data.len() * 2);
+    flate2::read::GzDecoder::new(data).read_to_end(&mut out)?;
+    Ok(out)
 }
 
 fn find_double_crlf(buf: &[u8]) -> Option<usize> {
