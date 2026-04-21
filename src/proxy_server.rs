@@ -121,6 +121,21 @@ impl ProxyServer {
             addr
         );
 
+        // Periodic stats log (every 60s at info level).
+        let stats_fronter = self.fronter.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await; // drop the immediate first tick
+            loop {
+                ticker.tick().await;
+                let s = stats_fronter.snapshot_stats();
+                if s.relay_calls > 0 || s.cache_hits > 0 {
+                    tracing::info!("{}", s.fmt_line());
+                }
+            }
+        });
+
         loop {
             let (sock, peer) = match listener.accept().await {
                 Ok(x) => x,

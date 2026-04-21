@@ -73,6 +73,9 @@ pub struct DomainFronter {
     inflight: Arc<Mutex<HashMap<String, broadcast::Sender<Vec<u8>>>>>,
     coalesced: AtomicU64,
     blacklist: Arc<std::sync::Mutex<HashMap<String, Instant>>>,
+    relay_calls: AtomicU64,
+    relay_failures: AtomicU64,
+    bytes_relayed: AtomicU64,
 }
 
 const BLACKLIST_COOLDOWN_SECS: u64 = 600;
@@ -138,7 +141,25 @@ impl DomainFronter {
             inflight: Arc::new(Mutex::new(HashMap::new())),
             coalesced: AtomicU64::new(0),
             blacklist: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            relay_calls: AtomicU64::new(0),
+            relay_failures: AtomicU64::new(0),
+            bytes_relayed: AtomicU64::new(0),
         })
+    }
+
+    pub fn snapshot_stats(&self) -> StatsSnapshot {
+        let bl = self.blacklist.lock().unwrap();
+        StatsSnapshot {
+            relay_calls: self.relay_calls.load(Ordering::Relaxed),
+            relay_failures: self.relay_failures.load(Ordering::Relaxed),
+            coalesced: self.coalesced.load(Ordering::Relaxed),
+            bytes_relayed: self.bytes_relayed.load(Ordering::Relaxed),
+            cache_hits: self.cache.hits(),
+            cache_misses: self.cache.misses(),
+            cache_bytes: self.cache.size(),
+            blacklisted_scripts: bl.len(),
+            total_scripts: self.script_ids.len(),
+        }
     }
 
     pub fn cache(&self) -> &ResponseCache {
@@ -287,6 +308,7 @@ impl DomainFronter {
         body: &[u8],
         cache_key_opt: Option<&str>,
     ) -> Vec<u8> {
+        self.relay_calls.fetch_add(1, Ordering::Relaxed);
         let bytes = match timeout(
             Duration::from_secs(REQUEST_TIMEOUT_SECS),
             self.do_relay_with_retry(method, url, headers, body),
@@ -295,14 +317,17 @@ impl DomainFronter {
         {
             Ok(Ok(bytes)) => bytes,
             Ok(Err(e)) => {
+                self.relay_failures.fetch_add(1, Ordering::Relaxed);
                 tracing::error!("Relay failed: {}", e);
                 return error_response(502, &format!("Relay error: {}", e));
             }
             Err(_) => {
+                self.relay_failures.fetch_add(1, Ordering::Relaxed);
                 tracing::error!("Relay timeout");
                 return error_response(504, "Relay timeout");
             }
         };
+        self.bytes_relayed.fetch_add(bytes.len() as u64, Ordering::Relaxed);
 
         if let Some(k) = cache_key_opt {
             if let Some(ttl) = parse_ttl(&bytes, url) {
@@ -765,6 +790,46 @@ fn parse_relay_json(body: &[u8]) -> Result<Vec<u8>, FronterError> {
     out.extend_from_slice(format!("Content-Length: {}\r\n\r\n", resp_body.len()).as_bytes());
     out.extend_from_slice(&resp_body);
     Ok(out)
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct StatsSnapshot {
+    pub relay_calls: u64,
+    pub relay_failures: u64,
+    pub coalesced: u64,
+    pub bytes_relayed: u64,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub cache_bytes: usize,
+    pub blacklisted_scripts: usize,
+    pub total_scripts: usize,
+}
+
+impl StatsSnapshot {
+    pub fn hit_rate(&self) -> f64 {
+        let total = self.cache_hits + self.cache_misses;
+        if total == 0 {
+            0.0
+        } else {
+            (self.cache_hits as f64 / total as f64) * 100.0
+        }
+    }
+
+    pub fn fmt_line(&self) -> String {
+        format!(
+            "stats: relay={} ({}KB) failures={} coalesced={} cache={}/{} ({:.0}% hit, {}KB) scripts={}/{} active",
+            self.relay_calls,
+            self.bytes_relayed / 1024,
+            self.relay_failures,
+            self.coalesced,
+            self.cache_hits,
+            self.cache_hits + self.cache_misses,
+            self.hit_rate(),
+            self.cache_bytes / 1024,
+            self.total_scripts - self.blacklisted_scripts,
+            self.total_scripts,
+        )
+    }
 }
 
 fn should_blacklist(status: u16, body: &str) -> bool {
