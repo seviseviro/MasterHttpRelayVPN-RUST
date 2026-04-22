@@ -90,6 +90,16 @@ struct UiState {
     last_test_msg: String,
     /// Per-SNI probe results, populated by Cmd::TestSni / TestAllSni.
     sni_probe: HashMap<String, SniProbeState>,
+    /// Most recent result of the Check-for-updates button (issue #15).
+    /// `None` = never checked this session. `Some(InFlight)` during the
+    /// probe, then the resolved outcome.
+    last_update_check: Option<UpdateProbeState>,
+}
+
+#[derive(Clone, Debug)]
+enum UpdateProbeState {
+    InFlight,
+    Done(mhrv_rs::update_check::UpdateCheck),
 }
 
 #[derive(Clone, Debug)]
@@ -118,6 +128,9 @@ enum Cmd {
         google_ip: String,
         snis: Vec<String>,
     },
+    /// Hit github.com + the Releases API and compare the running version
+    /// to the latest tag. Result is written to UiState::last_update_check.
+    CheckUpdate,
 }
 
 struct App {
@@ -766,6 +779,17 @@ impl eframe::App for App {
                 if ui.button("Check CA").clicked() {
                     let _ = self.cmd_tx.send(Cmd::CheckCaTrusted);
                 }
+
+                if ui.button("Check for updates")
+                    .on_hover_text(
+                        "Ping github.com, then ask the Releases API for the latest tag and \
+                         compare against this running version. No background polling — only \
+                         fires when you click this button."
+                    )
+                    .clicked()
+                {
+                    let _ = self.cmd_tx.send(Cmd::CheckUpdate);
+                }
             });
 
             if !last_test_msg.is_empty() {
@@ -794,6 +818,38 @@ impl eframe::App for App {
                      and many others don't.",
                     ca_path.display()
                 ));
+            }
+
+            // Update-check result (issue #15): only shown after the user
+            // clicks "Check for updates". No background polling.
+            if let Some(state) = &self.shared.state.lock().unwrap().last_update_check.clone() {
+                match state {
+                    UpdateProbeState::InFlight => {
+                        ui.small(egui::RichText::new("Checking for updates…")
+                            .color(egui::Color32::GRAY));
+                    }
+                    UpdateProbeState::Done(r) => {
+                        use mhrv_rs::update_check::UpdateCheck;
+                        let (txt, color) = match r {
+                            UpdateCheck::UpToDate { .. } => (
+                                r.summary(),
+                                egui::Color32::from_rgb(80, 180, 100),
+                            ),
+                            UpdateCheck::UpdateAvailable { .. } => (
+                                r.summary(),
+                                egui::Color32::from_rgb(220, 170, 80),
+                            ),
+                            UpdateCheck::Offline(_) | UpdateCheck::Error(_) => (
+                                r.summary(),
+                                egui::Color32::from_rgb(220, 110, 110),
+                            ),
+                        };
+                        ui.small(egui::RichText::new(txt).color(color));
+                        if let UpdateCheck::UpdateAvailable { release_url, .. } = r {
+                            ui.hyperlink_to("Open release page", release_url);
+                        }
+                    }
+                }
             }
 
             ui.separator();
@@ -1246,6 +1302,17 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                     let ca = base.join(CA_CERT_FILE);
                     let trusted = mhrv_rs::cert_installer::is_ca_trusted(&ca);
                     shared2.state.lock().unwrap().ca_trusted = Some(trusted);
+                });
+            }
+            Ok(Cmd::CheckUpdate) => {
+                let shared2 = shared.clone();
+                shared2.state.lock().unwrap().last_update_check =
+                    Some(UpdateProbeState::InFlight);
+                rt.spawn(async move {
+                    let result = mhrv_rs::update_check::check().await;
+                    push_log(&shared2, &format!("[ui] update check: {}", result.summary()));
+                    shared2.state.lock().unwrap().last_update_check =
+                        Some(UpdateProbeState::Done(result));
                 });
             }
             Err(_) => {}
