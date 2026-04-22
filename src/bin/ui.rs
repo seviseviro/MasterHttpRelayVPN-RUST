@@ -98,6 +98,12 @@ struct UiState {
     /// probe, then the resolved outcome.
     last_update_check: Option<UpdateProbeState>,
     last_update_check_at: Option<Instant>,
+    /// Set while a download of a release asset is in flight. `None` when
+    /// idle or after a completed download has been acknowledged.
+    download_in_progress: bool,
+    /// One-line status of the most recent download (Ok(path) or Err(msg)).
+    last_download: Option<Result<std::path::PathBuf, String>>,
+    last_download_at: Option<Instant>,
 }
 
 #[derive(Clone, Debug)]
@@ -134,7 +140,20 @@ enum Cmd {
     },
     /// Hit github.com + the Releases API and compare the running version
     /// to the latest tag. Result is written to UiState::last_update_check.
-    CheckUpdate,
+    /// `route` controls whether the request goes direct or is tunnelled
+    /// through our local HTTP proxy (useful when the user's ISP IP has
+    /// exhausted GitHub's unauthenticated rate limit).
+    CheckUpdate {
+        route: mhrv_rs::update_check::Route,
+    },
+    /// Download a release asset to ~/Downloads. Fires when the user clicks
+    /// the "Download update" button after a successful CheckUpdate surfaces
+    /// an UpdateAvailable with a matching platform asset.
+    DownloadUpdate {
+        route: mhrv_rs::update_check::Route,
+        url: String,
+        name: String,
+    },
 }
 
 struct App {
@@ -985,13 +1004,16 @@ impl eframe::App for App {
                 }
                 if ui.small_button("Check for updates")
                     .on_hover_text(
-                        "Ping github.com, then ask the Releases API for the latest tag and \
-                         compare against this running version. No background polling — only \
-                         fires when you click this button."
+                        "Ask GitHub's Releases API for the latest tag and compare against this \
+                         running version. When the proxy is running, the request is tunnelled \
+                         through it — so GitHub sees an Apps Script IP instead of your ISP IP \
+                         (different rate-limit bucket, and works even if GitHub is blocked on \
+                         your network). No background polling — only fires when you click."
                     )
                     .clicked()
                 {
-                    let _ = self.cmd_tx.send(Cmd::CheckUpdate);
+                    let route = self.update_check_route();
+                    let _ = self.cmd_tx.send(Cmd::CheckUpdate { route });
                 }
                 let _ = ACCENT_HOVER; // silence unused const warning if it occurs
             });
@@ -1002,7 +1024,7 @@ impl eframe::App for App {
             // Priority: update-check in flight > fresh test msg > fresh CA
             // result > update-check result. Old/expired entries are dropped.
             const TRANSIENT_TTL: Duration = Duration::from_secs(10);
-            let (test_msg_fresh, ca_trusted_fresh, update_check_fresh) = {
+            let (test_msg_fresh, ca_trusted_fresh, update_check_fresh, download_fresh) = {
                 let s = self.shared.state.lock().unwrap();
                 (
                     s.last_test_msg_at
@@ -1010,6 +1032,8 @@ impl eframe::App for App {
                     s.ca_trusted_at
                         .map_or(false, |t| t.elapsed() < TRANSIENT_TTL),
                     s.last_update_check_at
+                        .map_or(false, |t| t.elapsed() < TRANSIENT_TTL),
+                    s.last_download_at
                         .map_or(false, |t| t.elapsed() < TRANSIENT_TTL),
                 )
             };
@@ -1026,11 +1050,10 @@ impl eframe::App for App {
                 );
                 shown_any = true;
             } else if update_check_fresh {
-                if let Some(UpdateProbeState::Done(r)) =
-                    &self.shared.state.lock().unwrap().last_update_check.clone()
-                {
+                let done = self.shared.state.lock().unwrap().last_update_check.clone();
+                if let Some(UpdateProbeState::Done(r)) = done {
                     use mhrv_rs::update_check::UpdateCheck;
-                    let color = match r {
+                    let color = match &r {
                         UpdateCheck::UpToDate { .. } => OK_GREEN,
                         UpdateCheck::UpdateAvailable { .. } => {
                             egui::Color32::from_rgb(220, 170, 80)
@@ -1039,8 +1062,39 @@ impl eframe::App for App {
                     };
                     ui.horizontal(|ui| {
                         ui.small(egui::RichText::new(r.summary()).color(color));
-                        if let UpdateCheck::UpdateAvailable { release_url, .. } = r {
+                        if let UpdateCheck::UpdateAvailable {
+                            release_url, asset, ..
+                        } = &r
+                        {
                             ui.hyperlink_to("open release", release_url);
+                            if let Some(a) = asset {
+                                let dl_in_flight = self.shared.state.lock().unwrap().download_in_progress;
+                                if dl_in_flight {
+                                    ui.small(
+                                        egui::RichText::new("downloading…")
+                                            .color(egui::Color32::GRAY),
+                                    );
+                                } else {
+                                    let btn = egui::Button::new(
+                                        egui::RichText::new(format!(
+                                            "⤓ Download {} ({:.1} MB)",
+                                            a.name,
+                                            a.size_bytes as f64 / 1_048_576.0
+                                        ))
+                                        .color(egui::Color32::WHITE),
+                                    )
+                                    .fill(ACCENT)
+                                    .rounding(4.0);
+                                    if ui.add(btn).clicked() {
+                                        let route = self.update_check_route();
+                                        let _ = self.cmd_tx.send(Cmd::DownloadUpdate {
+                                            route,
+                                            url: a.download_url.clone(),
+                                            name: a.name.clone(),
+                                        });
+                                    }
+                                }
+                            }
                         }
                     });
                     shown_any = true;
@@ -1052,6 +1106,34 @@ impl eframe::App for App {
                     ERR_RED
                 };
                 ui.small(egui::RichText::new(last_test_msg).color(color));
+                shown_any = true;
+            } else if download_fresh {
+                let dl = self.shared.state.lock().unwrap().last_download.clone();
+                match dl {
+                    Some(Ok(path)) => {
+                        ui.horizontal(|ui| {
+                            ui.small(
+                                egui::RichText::new(format!("Downloaded → {}", path.display()))
+                                    .color(OK_GREEN),
+                            );
+                            if ui.small_button("show in folder").clicked() {
+                                reveal_in_file_manager(&path);
+                            }
+                        });
+                    }
+                    Some(Err(msg)) => {
+                        ui.small(
+                            egui::RichText::new(format!("Download failed: {}", msg))
+                                .color(ERR_RED),
+                        );
+                    }
+                    None => {
+                        ui.small(
+                            egui::RichText::new("Downloading…")
+                                .color(egui::Color32::GRAY),
+                        );
+                    }
+                }
                 shown_any = true;
             } else if ca_trusted_fresh {
                 match ca_trusted {
@@ -1174,6 +1256,25 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// Pick the route for an update-check or download request: if the
+    /// proxy is running and we have a local HTTP listen_port, tunnel
+    /// through it (GitHub sees Apps Script's IP instead of the user's
+    /// rate-limited ISP IP). Otherwise go direct.
+    fn update_check_route(&self) -> mhrv_rs::update_check::Route {
+        let running = self.shared.state.lock().unwrap().running;
+        if running {
+            if let Ok(port) = self.form.listen_port.trim().parse::<u16>() {
+                let host = if self.form.listen_host.trim().is_empty() {
+                    "127.0.0.1".to_string()
+                } else {
+                    self.form.listen_host.trim().to_string()
+                };
+                return mhrv_rs::update_check::Route::Proxy { host, port };
+            }
+        }
+        mhrv_rs::update_check::Route::Direct
+    }
+
     /// Floating editor window for the SNI rotation pool. Opens from the
     /// **SNI pool…** button in the main form. The list is live-editable
     /// (reorder / toggle / add / remove); changes only persist when the user
@@ -1601,7 +1702,7 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                     st.ca_trusted_at = Some(Instant::now());
                 });
             }
-            Ok(Cmd::CheckUpdate) => {
+            Ok(Cmd::CheckUpdate { route }) => {
                 let shared2 = shared.clone();
                 {
                     let mut st = shared2.state.lock().unwrap();
@@ -1609,12 +1710,47 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                     st.last_update_check_at = Some(Instant::now());
                 }
                 rt.spawn(async move {
-                    let result = mhrv_rs::update_check::check().await;
+                    let result = mhrv_rs::update_check::check(route).await;
                     push_log(&shared2, &format!("[ui] update check: {}", result.summary()));
                     {
                         let mut st = shared2.state.lock().unwrap();
                         st.last_update_check = Some(UpdateProbeState::Done(result));
                         st.last_update_check_at = Some(Instant::now());
+                    }
+                });
+            }
+            Ok(Cmd::DownloadUpdate { route, url, name }) => {
+                let shared2 = shared.clone();
+                {
+                    let mut st = shared2.state.lock().unwrap();
+                    st.download_in_progress = true;
+                    st.last_download = None;
+                }
+                push_log(&shared, &format!("[ui] downloading {}", name));
+                rt.spawn(async move {
+                    let dir = downloads_dir();
+                    let out = dir.join(&name);
+                    let result = mhrv_rs::update_check::download_asset(route, &url, &out).await;
+                    let mut st = shared2.state.lock().unwrap();
+                    st.download_in_progress = false;
+                    st.last_download_at = Some(Instant::now());
+                    match result {
+                        Ok(bytes) => {
+                            push_log(
+                                &shared2,
+                                &format!(
+                                    "[ui] download ok: {} ({} bytes) -> {}",
+                                    name,
+                                    bytes,
+                                    out.display()
+                                ),
+                            );
+                            st.last_download = Some(Ok(out));
+                        }
+                        Err(e) => {
+                            push_log(&shared2, &format!("[ui] download failed: {}", e));
+                            st.last_download = Some(Err(e));
+                        }
                     }
                 });
             }
@@ -1706,6 +1842,37 @@ fn install_ui_tracing(shared: Arc<Shared>) {
         .with_ansi(false)
         .with_writer(writer)
         .try_init();
+}
+
+/// Where we drop downloaded release assets. Prefer the OS user Downloads
+/// dir (via the directories crate that's already in our tree), fall back
+/// to the user-data dir for platforms that don't expose one (edge case).
+fn downloads_dir() -> std::path::PathBuf {
+    directories::UserDirs::new()
+        .and_then(|u| u.download_dir().map(|p| p.to_path_buf()))
+        .unwrap_or_else(data_dir::data_dir)
+}
+
+/// Open the OS file manager with the given file highlighted/selected.
+/// Best-effort: fires the platform-specific command and swallows errors.
+fn reveal_in_file_manager(p: &std::path::Path) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg("-R").arg(p).spawn();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let arg = format!("/select,\"{}\"", p.display());
+        let _ = std::process::Command::new("explorer").arg(arg).spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        // No universal "select this file" primitive on Linux; just open
+        // the containing folder.
+        if let Some(parent) = p.parent() {
+            let _ = std::process::Command::new("xdg-open").arg(parent).spawn();
+        }
+    }
 }
 
 fn push_log(shared: &Shared, msg: &str) {
