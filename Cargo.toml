@@ -52,7 +52,6 @@ eframe = { version = "0.28", default-features = false, features = [
     "glow",
     "persistence",
 ], optional = true }
-reqwest = { version = "0.13.2", features = ["json"] }
 
 [profile.release]
 panic = "abort"
